@@ -1,3 +1,6 @@
+IMPORTANT: This repo is a fork of [SD-VLM](https://github.com/cpystan/SD-VLM), but rebased off of the [LLaVA](https://github.com/haotian-liu/LLaVA) and [Depth Anything V2](https://github.com/DepthAnything-Vision/Depth-Anything-V2) repos, so that the changes are clear.
+
+
 # 👷SD-VLM: Spatial Measuring and Understanding with Depth-Encoded Vision-Language Models
 
 
@@ -9,16 +12,11 @@
 
 ---
 
-## Install
-
-1. Clone this repository
-```bash
-git clone https://github.com/cpystan/SD-VLM.git
-cd SD-VLM
+git clone https://github.com/thandal/LLaVA-SD-VLM.git
+cd LLaVA-SD-VLM
 ```
 
 2. Install Package
-```Shell
 conda create -n sdvlm python=3.10 -y
 conda activate sdvlm
 pip install --upgrade pip  # enable PEP 660 support
