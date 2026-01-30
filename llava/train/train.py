@@ -21,9 +21,9 @@ import json
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
-
+import base64
 import torch
-
+from datasets import load_dataset
 import transformers
 import tokenizers
 
@@ -36,11 +36,16 @@ from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
-
-
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+import numpy as np
+import cv2
 local_rank = None
-
-
+import re
+import deepspeed
+from io import BytesIO
+import pandas as pd
+deepspeed.ops.op_builder.CPUAdamBuilder().load()
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
@@ -53,6 +58,8 @@ IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= versio
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    depth_path: Optional[str] = field(default=None)
+    use_depth: bool = field(default=False)
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
@@ -74,6 +81,7 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    gt_depth: bool = field(default=False)
 
 
 @dataclass
@@ -305,6 +313,7 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
     return conversation
 
 
+
 def preprocess_multimodal(
     sources: Sequence[str],
     data_args: DataArguments
@@ -327,7 +336,6 @@ def preprocess_multimodal(
             sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
 
     return sources
-
 
 def preprocess_llama_2(
     sources,
@@ -578,7 +586,7 @@ def preprocess_mpt(
                     f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
                     f" (ignored)"
                 )
-
+    
     return dict(
         input_ids=input_ids,
         labels=targets,
@@ -619,6 +627,7 @@ def preprocess(
     3. Tokenize the concatenated conversation;
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
+
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
@@ -662,15 +671,19 @@ class LazySupervisedDataset(Dataset):
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
 
+        list_data_dict = load_dataset(data_path,download_mode="reuse_dataset_if_exists")['train']
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
+        #self.image_folder = data_args.image_folder
         self.data_args = data_args
+
+
 
     def __len__(self):
         return len(self.list_data_dict)
+
 
     @property
     def lengths(self):
@@ -678,27 +691,45 @@ class LazySupervisedDataset(Dataset):
         for sample in self.list_data_dict:
             img_tokens = 128 if 'image' in sample else 0
             length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+            tmp = sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens
         return length_list
 
+    def base64_to_pil(self,image_base64):
+        try:
+            # 解码base64字符串
+            image_data = base64.b64decode(image_base64)
+            # 创建字节流并打开为图像
+            image = Image.open(BytesIO(image_data))
+            return image
+        except Exception as e:
+            print(f"转换失败: {e}")
+            return None
     @property
     def modality_lengths(self):
         length_list = []
-        for sample in self.list_data_dict:
+        for i in range(len(self.list_data_dict)):
+            sample = self.list_data_dict.iloc[i]
+
             cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
             cur_len = cur_len if 'image' in sample else -cur_len
             length_list.append(cur_len)
         return length_list
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        if 'image' in sources[0]:
-            image_file = self.list_data_dict[i]['image']
-            image_folder = self.data_args.image_folder
+
+        if   ('image' in sources[0].keys()):  # MSMU dataset
+
             processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            
+            image = sources[0]['image']
+
+            ori_img = copy.deepcopy(image)
+            
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -719,25 +750,78 @@ class LazySupervisedDataset(Dataset):
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
+
+        elif ('image_id' in sources[0].keys()) or ('id' in sources[0].keys()) :    #LLaVA-Instruct-665k
+            if 'image' in sources[0] or 'image_id' in sources[0] :
+                #image_folder = self.data_args.image_folder
+
+                image_folder = self.image_folder
+                if 'image' in sources[0]:
+
+                    image_file = sources[0]['image']
+                    image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+                    assert self.data_args.gt_depth==False
+                    ori_img = copy.deepcopy(image)
+                    #ori_img = cv2.imread(os.path.join(image_folder, image_file))
+
+
+                else:
+                    image_file = sources[0]['image_id'] + '.jpg'
+                    image_file = os.path.join('textvqa/train_images',image_file)
+                    image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+                    assert self.data_args.gt_depth==False
+                    ori_img = copy.deepcopy(image)
+                    #ori_img = cv2.imread(os.path.join(image_folder, image_file))
+
+                processor = self.data_args.image_processor
+                if self.data_args.image_aspect_ratio == 'pad':
+                    def expand2square(pil_img, background_color):
+                        width, height = pil_img.size
+                        if width == height:
+                            return pil_img
+                        elif width > height:
+                            result = Image.new(pil_img.mode, (width, width), background_color)
+                            result.paste(pil_img, (0, (width - height) // 2))
+                            return result
+                        else:
+                            result = Image.new(pil_img.mode, (height, height), background_color)
+                            result.paste(pil_img, ((height - width) // 2, 0))
+                            return result
+                    image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                else:
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                sources = preprocess_multimodal(
+                    copy.deepcopy([e["conversations"] for e in sources]),
+                    self.data_args)
+            else:
+                sources = copy.deepcopy([e["conversations"] for e in sources])
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
+
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            #has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in str(sources)))
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
+
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
+            data_dict['ori_img'] = ori_img
+        elif 'SpatialRGPT' in self.data_args.data_path:
+            data_dict['image'] = image
+            data_dict['ori_img'] = ori_img
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            data_dict['ori_img'] = None
         return data_dict
-
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
@@ -765,10 +849,14 @@ class DataCollatorForSupervisedDataset(object):
 
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]
+
+            ori_imgs = [instance['ori_img'] for instance in instances]
+
             if all(x is not None and x.shape == images[0].shape for x in images):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+            batch['ori_imgs'] = ori_imgs
 
         return batch
 
@@ -824,13 +912,25 @@ def train(attn_implementation=None):
                 **bnb_model_from_pretrained_args
             )
         else:
+            print (model_args.model_name_or_path)
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
+                use_depth = model_args.use_depth,
+                gt_depth = data_args.gt_depth,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
+            depth_state = torch.load(model_args.depth_path)
+
+            model_dict = model.state_dict()
+            pretrained_dict = {'depth.'+key: value for key, value in depth_state.items() if ('depth.'+key) in model_dict.keys() }
+
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
+
+
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -907,6 +1007,8 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
+
+    
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
             model_args=model_args,
@@ -943,6 +1045,9 @@ def train(attn_implementation=None):
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
+
+                    
+
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
@@ -958,6 +1063,7 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
@@ -970,7 +1076,7 @@ def train(attn_implementation=None):
     trainer.save_state()
 
     model.config.use_cache = True
-
+    
     if training_args.lora_enable:
         state_dict = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias

@@ -56,8 +56,9 @@ def eval_model(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
 
         image = Image.open(os.path.join(args.image_folder, image_file)).convert('RGB')
-        image_tensor = process_images([image], image_processor, model.config)[0]
 
+        image_tensor = process_images([image], image_processor, model.config)[0]
+        model.gt_depth = False
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
@@ -66,6 +67,7 @@ def eval_model(args):
                 do_sample=True if args.temperature > 0 else False,
                 temperature=args.temperature,
                 top_p=args.top_p,
+                ori_imgs=[image],
                 num_beams=args.num_beams,
                 # no_repeat_ngram_size=3,
                 max_new_tokens=1024,

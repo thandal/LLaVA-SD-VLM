@@ -7,12 +7,13 @@ import time
 
 NUM_SECONDS_TO_SLEEP = 0.5
 
-
+openai.api_key = ''
 def get_eval(content: str, max_tokens: int):
     while True:
         try:
-            response = openai.ChatCompletion.create(
-                model='gpt-4-0314',
+
+            response = openai.chat.completions.create(
+                model='gpt-4-turbo',
                 messages=[{
                     'role': 'system',
                     'content': 'You are a helpful and precise assistant for checking the quality of the answer.'
@@ -30,7 +31,7 @@ def get_eval(content: str, max_tokens: int):
             print(e)
         time.sleep(NUM_SECONDS_TO_SLEEP)
 
-    return response['choices'][0]['message']['content']
+    return response.choices[0].message.content 
 
 
 def parse_score(review):

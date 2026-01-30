@@ -24,7 +24,11 @@ from .multimodal_projector.builder import build_vision_projector
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
+import torch.nn.functional as F
+import numpy as np
 
+from torchvision.transforms import ToPILImage
+from PIL import Image
 
 class LlavaMetaModel:
 
@@ -134,18 +138,182 @@ class LlavaMetaForCausalLM(ABC):
     def get_model(self):
         pass
 
+    def get_depth(self):
+        pass
+
+    def rotate_half(self, x):
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+
+    def depth_sincos_encoding(self,img_features,depth_features):
+
+        #if not isinstance(image_features,list):
+         #   img_features = [img_features]
+        depth_features = torch.cat(depth_features,dim=0)
+        depth_features =depth_features.reshape(depth_features.shape[0],-1)
+        B, L, dim = img_features.shape
+        assert dim % 2 == 0, "wrong dim"
+        position_embedding = torch.zeros(B,L, dim, dtype=img_features.dtype).to(depth_features.device)
+
+        omega = torch.arange(dim//2, dtype=img_features.dtype)
+        omega /= dim/2.
+        omega = 1./(10000**omega)
+
+        sita = depth_features[:,:,None] @ omega[None,:].to(depth_features.device).to(depth_features.dtype)
+        emb_sin = torch.sin(sita)
+        emb_cos = torch.cos(sita)
+
+        position_embedding[:,:,0::2] = emb_sin
+        position_embedding[:,:,1::2] = emb_cos
+
+        #if True:
+          #  return torch.cat([img_features,position_embedding.to(img_features.device)],dim=1)
+        return position_embedding.to(img_features.device) + img_features
+    
+    
+    def depth_sincos_encoding_fixed(self,depth_features,shape):
+
+        #if not isinstance(image_features,list):
+         #   img_features = [img_features]
+        depth_features = torch.cat(depth_features,dim=0)
+        depth_features =depth_features.reshape(depth_features.shape[0],-1)
+        B, L, dim = shape
+        assert dim % 2 == 0, "wrong dim"
+        position_embedding = torch.zeros(B,L, dim).to(depth_features.device)
+
+        omega = torch.arange(dim//2, dtype=torch.float)
+        omega /= dim/2.
+        omega = 1./(10000**omega)
+
+        sita = depth_features[:,:,None] @ omega[None,:].to(depth_features.device).to(depth_features.dtype)
+        emb_sin = torch.sin(sita)
+        emb_cos = torch.cos(sita)
+
+        position_embedding[:,:,0::2] = emb_sin
+        position_embedding[:,:,1::2] = emb_cos
+
+        return position_embedding
+
+    def depth_projection(self,img_features,depth_features):
+
+        depth_features = torch.cat(depth_features,dim=0)
+        if len(depth_features.shape)==3:
+            depth_features = depth_features.unsqueeze(1)
+
+        depth_embeddings = self.get_model().get_vision_tower()(depth_features.repeat(1,3,1,1).to(img_features.device))
+        depth_embeddings = self.get_model().mm_projector(depth_embeddings.half())
+        return torch.cat([img_features, depth_embeddings],dim=1)
+
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
+    def encode_images(self, images,depths=None):
+
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    def encode_depth(self, images, target_size, alpha=100):
+
+        with torch.no_grad():
+            depths =[]
+            for image in images:
+
+                if image==None:
+                    depth = torch.zeros(1,target_size[0],target_size[1]).cuda()
+                else:
+                    tmp = np.asarray(image)[:,:,[2,1,0]]
+
+                    tmp, (h, w) = self.depth.image2tensor(tmp)
+
+
+                    depth = self.depth(tmp.to(torch.float16).cuda())
+
+
+                depth = torch.nn.AdaptiveAvgPool2d(target_size)(depth)  
+                
+
+                #normalize to 0 to 1
+                data_min = depth.min()
+                data_max = depth.max()
+                
+                depth = (depth-data_min)/(data_max-data_min+1e-9)
+
+                depths.append(depth*alpha)
+
+        return depths
+    
+
+
+    def custom_adaptive_avg_pool2d(self,input_tensor, output_size):
+        # 获取输入张量的尺寸
+        batch_size, channels, height, width = input_tensor.size()
+        
+        # 计算每个维度的缩放因子
+        scale_h = height / output_size[0]
+        scale_w = width / output_size[1]
+        
+        # 初始化输出张量
+        output = torch.zeros(batch_size, channels, output_size[0], output_size[1])
+        
+        # 遍历每个输出位置
+        for b in range(batch_size):
+            for c in range(channels):
+                for i in range(output_size[0]):
+                    for j in range(output_size[1]):
+                        # 计算输入张量中对应的区域
+                        h_start = int(i * scale_h)
+                        h_end = int((i + 1) * scale_h)
+                        w_start = int(j * scale_w)
+                        w_end = int((j + 1) * scale_w)
+                        
+                        # 获取当前区域的数据
+                        region = input_tensor[b, c, h_start:h_end, w_start:w_end]
+                        
+                        # 计算非零元素的平均值
+                        non_zero_elements = region[region != 0]
+                        if non_zero_elements.numel() > 0:
+                            avg = non_zero_elements.mean()
+                        else:
+                            avg = 0
+                        
+                        output[b, c, i, j] = avg
+        
+        return output
+    
+    
+    def resize_depth(self,images,target_size,alpha=100):
+        depths =[]
+        for image in images:
+            if self.vit_depth:
+                tmp = image.clone().detach()
+                depth = self.custom_adaptive_avg_pool2d(tmp.unsqueeze(0),target_size)
+            else:
+                tmp2 = torch.from_numpy(np.asarray(image).copy())
+                tmp2 = tmp2.cuda().half().unsqueeze(0)
+
+
+                depth = self.custom_adaptive_avg_pool2d(tmp2.unsqueeze(0),target_size)
+
+            #normalize to 0 to 1
+            data_min = depth.min()
+            data_max = depth.max()
+            
+            depth = (depth-data_min)/(data_max-data_min+1e-9)
+
+            depths.append(depth*alpha)
+
+
+        return depths
+
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        images, ori_imgs, image_sizes=None
     ):
+        #torch.cuda.empty_cache()
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
@@ -153,8 +321,9 @@ class LlavaMetaForCausalLM(ABC):
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -199,7 +368,21 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            image_features = self.encode_images(images)               
+   
+
+        target_size=(24,24)
+        if self.gt_depth:
+        # directly extract depth from depth image
+            depth_features = self.resize_depth(ori_imgs,target_size)
+        else:
+        # generate depth embedding using depth model
+            depth_features = self.encode_depth(ori_imgs,target_size)
+            # # fuse depth embedding
+        if self.use_depth:
+            image_features = self.depth_sincos_encoding(image_features,depth_features)
+
+        
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -320,6 +503,7 @@ class LlavaMetaForCausalLM(ABC):
 
         if _position_ids is None:
             position_ids = None
+
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 

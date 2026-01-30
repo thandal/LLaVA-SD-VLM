@@ -45,6 +45,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
 
+  
     if 'llava' in model_name.lower():
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
@@ -60,9 +61,19 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
                 model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
 
+            print('Loading depth from depth model...')
+            depth_state = torch.load('/mnt/tqnas/ali/home/lubin.fan/ckpts/Depth-Anything-V2-Large/depth_anything_v2_vitl.pth')
+
+            model_dict = model.state_dict()
+            pretrained_dict = {'depth.'+key: value for key, value in depth_state.items() if ('depth.'+key) in model_dict.keys() }
+
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
+
             print('Loading additional LLaVA weights...')
             if os.path.exists(os.path.join(model_path, 'non_lora_trainables.bin')):
                 non_lora_trainables = torch.load(os.path.join(model_path, 'non_lora_trainables.bin'), map_location='cpu')
+
             else:
                 # this is probably from HF Hub
                 from huggingface_hub import hf_hub_download

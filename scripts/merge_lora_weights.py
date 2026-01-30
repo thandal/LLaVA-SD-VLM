@@ -9,6 +9,7 @@ def merge_lora(args):
 
     model.save_pretrained(args.save_model_path)
     tokenizer.save_pretrained(args.save_model_path)
+    print(f'save at {args.save_model_path}')
 
 
 if __name__ == "__main__":
@@ -20,3 +21,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     merge_lora(args)
+    print('done!')

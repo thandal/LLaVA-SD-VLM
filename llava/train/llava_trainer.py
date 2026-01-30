@@ -59,6 +59,7 @@ def split_to_even_chunks(indices, lengths, num_chunks):
 
 def get_modality_length_grouped_indices(lengths, batch_size, world_size, generator=None):
     # We need to use torch for the random part as a distributed sampler will set the random seed for torch.
+
     assert all(l != 0 for l in lengths), "Should not have zero length."
     if all(l > 0 for l in lengths) or all(l < 0 for l in lengths):
         # all samples are in the same modality
