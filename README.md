@@ -111,7 +111,7 @@ Some arguments in the script need to be modified:
 
 Step 1: Load the checkpoint and conduct inference on MSMU-Bench.
 ```Shell
-python evaluation/inference.py --model-path 'SD-VLM-7B' --data 'MSMU' --vision-tower 'clip-vit-large-patch14-336'
+python evaluation/inference.py --model-path 'cpystan/SD-VLM-7B' --data 'cpystan/MSMU' --vision-tower 'openai/clip-vit-large-patch14-336' --load-8bit true
 ```
 
 Step 2: Load the json file saved from step 1 and use GPT-4-Turbo to get the evaluation response.

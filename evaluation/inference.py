@@ -8,6 +8,9 @@ from PIL import Image
 import sys
 sys.path.append("./")
 import argparse
+
+from datasets import load_dataset
+
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
@@ -60,7 +63,6 @@ def eval_llava(args):
         json.dumps(
             {
                 "model": args.model_path,
-
             }
         )
         + "\n"
@@ -73,31 +75,44 @@ def eval_llava(args):
     top_p = None
     num_beams = 1
 
-
     disable_torch_init()
     model_path = os.path.expanduser(model_path)
     model_name = get_model_name_from_path(model_path)
 
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, model_base, model_name, mm_vision_tower=args.vision_tower)
-    model.to(torch.float16)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        model_path,
+        model_base,
+        model_name,
+        mm_vision_tower=args.vision_tower,
+        load_4bit=args.load_4bit,
+        load_8bit=args.load_8bit)
+#    model.to(torch.float16)
     model.gt_depth = eval(args.gt_depth)
     model.use_depth = eval(args.use_depth)
     print(f'use gt depth: {model.gt_depth}')
 
-    data = load_dataset(data_path,download_mode="reuse_dataset_if_exists")['test']
-
-    
-
-
+    data = load_dataset(data_path)['test']
+    #data = load_dataset(data_path, streaming=True)['train']  # Takes > 100 GB of ram?!
 
     count = 0
 
-    for i in tqdm(range(len(data[:]))):
-        sample = data[i]
+    for sample in data:
         count+=1
-        prompt = sample['conversations'][0]['value']
-        image = sample['image']
+        conversations = sample['conversations']
+        # HACKETY HACK HACK
+        conversations = conversations.replace("'from': 'human'", "\"from\": \"human\"")
+        conversations = conversations.replace("'from': 'gpt'", "\"from\": \"gpt\"")
+        conversations = conversations.replace("'value': '", "\"value\": \"")
+        conversations = conversations.replace("'value'", "\"value\"")
+        conversations = conversations.replace("'}", "\"}")
+        conversations = conversations.replace("}", "},")
+        conversations = conversations.replace("},]", "}]")
+        #print(" conversations >>>", conversations)
+        conversations = json.loads(conversations)
+        prompt = conversations[0]['value']
+        print("prompt >>>", prompt)
 
+        image = sample['image']
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
 
         if model.gt_depth:
@@ -105,11 +120,7 @@ def eval_llava(args):
         else:
             ori_img = copy.deepcopy(image)
 
-
- 
         image_tensor = process_images([image], image_processor, model.config)[0]
-        
-
 
         with torch.inference_mode():
             output_ids = model.generate(
@@ -125,12 +136,11 @@ def eval_llava(args):
                 max_new_tokens=1024,
                 use_cache=True,)
 
-
         response= tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-
-       
-        gt = sample['conversations'][1]['value']
         print(f'pred:{response}')
+       
+        gt = conversations[1]['value']
+        print(f'gt:{gt}')
 
         ans_file.write(
                 json.dumps(
@@ -138,7 +148,7 @@ def eval_llava(args):
                         "question": prompt,
                         "pred": response,
                         "gt": gt,
-                        "type": sample['type'],
+#                        "type": sample['type'],
                     }
                 )
                 + "\n"
@@ -154,6 +164,8 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="path-to-benchmark")
     parser.add_argument("--gt-depth", type=str, default="False")
     parser.add_argument("--use-depth", type=str, default="True")
+    parser.add_argument("--load-4bit", type=str, default="False")
+    parser.add_argument("--load-8bit", type=str, default="False")
     parser.add_argument("--vision-tower", type=str, default="path-to-vit")
     parser.add_argument("--mode", type=str, default='llava')
     args = parser.parse_args()
